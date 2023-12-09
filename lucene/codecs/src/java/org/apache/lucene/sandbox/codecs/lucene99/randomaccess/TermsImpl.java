@@ -280,6 +280,7 @@ final class TermsImpl extends Terms {
     public BytesRef next() throws IOException {
       if (fstFsaIntersectEnum.next()) {
         term = fstFsaIntersectEnum.getTerm();
+        isTermStateCurrent = false;
       } else {
         term = null;
       }

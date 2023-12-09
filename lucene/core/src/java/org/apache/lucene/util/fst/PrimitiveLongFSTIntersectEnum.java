@@ -141,8 +141,6 @@ public final class PrimitiveLongFSTIntersectEnum {
             nextFrame.output = currentFrame.output + currentFrame.fstNode.output();
             ensureStackCapacity();
             stack[++currentLevel] = nextFrame;
-            ;
-            currentLevel++;
           } else {
             // we went past the target of FST, put the current candidate as pending.
             pending = true;

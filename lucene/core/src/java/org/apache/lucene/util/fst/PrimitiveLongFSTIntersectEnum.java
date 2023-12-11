@@ -56,6 +56,8 @@ public final class PrimitiveLongFSTIntersectEnum {
 
   boolean pending;
 
+  boolean isEmptyValidOutput;
+
   public PrimitiveLongFSTIntersectEnum(
       PrimitiveLongFST fst, CompiledAutomaton automaton, BytesRef startTerm) throws IOException {
     this.fst = fst;
@@ -72,10 +74,17 @@ public final class PrimitiveLongFSTIntersectEnum {
 
     if (startTerm != null) {
       seekToStartTerm(startTerm);
+    } else {
+      isEmptyValidOutput = isAccept(firstFrame.fstNode, firstFrame.fsaState);
     }
   }
 
   public boolean next() throws IOException {
+    if (isEmptyValidOutput) {
+      fstOutput = fst.getEmptyOutput();
+      isEmptyValidOutput = false;
+      return true;
+    }
     while (currentLevel >= 0) {
       Frame currentFrame = stack[currentLevel];
 
@@ -126,30 +135,33 @@ public final class PrimitiveLongFSTIntersectEnum {
 
     while (currentLevel < length) {
       Frame currentFrame = stack[currentLevel];
-      int target = startTerm.bytes[startTerm.offset + currentLevel];
+      int target = startTerm.bytes[startTerm.offset + currentLevel] & 0xff;
 
       if (hasDescendants(currentFrame.fstNode, currentFrame.fsaState)) {
-        initArcAndTransition(currentFrame);
-        currentFrame.transitionUpto = 0;
-        if (fstAdvanceCeil(target, currentFrame.fstCandidateNode)
-            && fsaAdvanceCeil(currentFrame, target)) {
-          if (currentFrame.fstCandidateNode.label() == target) {
-            term.append((byte) target);
-            Frame nextFrame = new Frame();
-            nextFrame.fstNode = currentFrame.fstCandidateNode;
-            nextFrame.fsaState = currentFrame.fsaTransition.dest;
-            nextFrame.output = currentFrame.output + currentFrame.fstNode.output();
-            ensureStackCapacity();
-            stack[++currentLevel] = nextFrame;
-          } else {
-            // we went past the target of FST, put the current candidate as pending.
-            pending = true;
-            break;
-          }
-        } else {
-          break;
+        initArcAndTransition(currentFrame, false);
+        fstAdvanceCeil(target, currentFrame.fstCandidateNode);
+        fsaAdvanceCeil(currentFrame, target);
+
+        if (currentFrame.fstCandidateNode.label() == target
+            && (currentFrame.fsaTransition.min <= target
+                && target <= currentFrame.fsaTransition.max)) {
+          term.append((byte) target);
+          Frame nextFrame = new Frame();
+          nextFrame.fstNode = currentFrame.fstCandidateNode;
+          nextFrame.fsaState = currentFrame.fsaTransition.dest;
+          nextFrame.output = currentFrame.output + currentFrame.fstNode.output();
+          ensureStackCapacity();
+          stack[++currentLevel] = nextFrame;
+          continue;
         }
+
+        if (currentFrame.fstCandidateNode.label() > target
+            || currentFrame.fsaTransition.min > target) {
+          pending = true;
+        }
+        break;
       } else {
+        // all prefix upto this level is match, but the term to seek is longer
         break;
       }
     }
@@ -169,20 +181,23 @@ public final class PrimitiveLongFSTIntersectEnum {
         && PrimitiveLongFST.targetHasArcs(fstNode);
   }
 
-  private void initArcAndTransition(Frame frame) throws IOException {
+  private void initArcAndTransition(Frame frame, boolean advanceToFirstTransition)
+      throws IOException {
     frame.fstCandidateNode = new PrimitiveLongArc();
     fst.readFirstRealTargetArc(frame.fstNode.target(), frame.fstCandidateNode, fstBytesReader);
 
     frame.fsaTransition = new Transition();
     frame.numTransitions = transitionAccessor.initTransition(frame.fsaState, frame.fsaTransition);
-    transitionAccessor.getNextTransition(frame.fsaTransition);
-    frame.transitionUpto++;
+    if (advanceToFirstTransition) {
+      transitionAccessor.getNextTransition(frame.fsaTransition);
+      frame.transitionUpto++;
+    }
   }
 
   private boolean findNextIntersection(Frame frame) throws IOException {
     if (frame.fstCandidateNode == null) {
       // when called first time, init first FST arc and the FSA transition
-      initArcAndTransition(frame);
+      initArcAndTransition(frame, true);
     } else if (pending) {
       pending = false;
     } else {
@@ -206,7 +221,9 @@ public final class PrimitiveLongFSTIntersectEnum {
         // TODO: advance to first arc that has label >= fsaTransition.min
         //        frame.fstCandidateNode =
         //                fst.readNextRealArc(frame.fstCandidateNode, fstBytesReader);
-        fstAdvanceCeil(frame.fsaTransition.min, frame.fstCandidateNode);
+        if (fstAdvanceCeil(frame.fsaTransition.min, frame.fstCandidateNode) == false) {
+          return false;
+        }
       } else if (frame.fstCandidateNode.label() > frame.fsaTransition.max) {
         // advance FSA
         if (frame.transitionUpto == frame.numTransitions) {
@@ -216,9 +233,7 @@ public final class PrimitiveLongFSTIntersectEnum {
         // TODO: advance FSA with binary search to fstNode.label()
         //        transitionAccessor.getNextTransition(frame.fsaTransition);
         //        frame.transitionUpto++;
-        if (fsaAdvanceCeil(frame, frame.fstCandidateNode.label()) == false) {
-          return false;
-        }
+        fsaAdvanceCeil(frame, frame.fstCandidateNode.label());
       } else {
         // can go deeper
         return true;
@@ -244,7 +259,10 @@ public final class PrimitiveLongFSTIntersectEnum {
     if (arc.bytesPerArc() != 0 && arc.label() != PrimitiveLongFST.END_LABEL) {
       if (arc.nodeFlags() == PrimitiveLongFST.ARCS_FOR_CONTINUOUS) {
         int targetIndex = target - arc.label() + arc.arcIdx();
-        if (targetIndex >= arc.numArcs() || targetIndex < 0) {
+        if (targetIndex < 0) {
+          return false;
+        } else if (targetIndex >= arc.numArcs()) {
+          fst.readArcByContinuous(arc, fstBytesReader, arc.numArcs() - 1);
           return false;
         } else {
           fst.readArcByContinuous(arc, fstBytesReader, targetIndex);
@@ -254,6 +272,9 @@ public final class PrimitiveLongFSTIntersectEnum {
         // Fixed length arcs in a direct addressing node.
         int targetIndex = target - arc.label() + arc.arcIdx();
         if (targetIndex >= arc.numArcs() || targetIndex < 0) {
+          return false;
+        } else if (targetIndex >= arc.numArcs()) {
+          fst.readArcByDirectAddressing(arc, fstBytesReader, arc.numArcs() - 1);
           return false;
         } else {
           if (PrimitiveLongArc.BitTable.isBitSet(targetIndex, arc, fstBytesReader)) {
@@ -276,6 +297,7 @@ public final class PrimitiveLongFSTIntersectEnum {
       }
       idx = -1 - idx;
       if (idx == arc.numArcs()) {
+        fst.readArcByIndex(arc, fstBytesReader, arc.numArcs() - 1);
         // DEAD END!
         return false;
       }
@@ -296,7 +318,7 @@ public final class PrimitiveLongFSTIntersectEnum {
     }
   }
 
-  private boolean fsaAdvanceCeil(Frame frame, int target) {
+  private void fsaAdvanceCeil(Frame frame, int target) {
     int low = frame.transitionUpto;
     int high = frame.numTransitions;
     Transition t = frame.fsaTransition;
@@ -312,18 +334,22 @@ public final class PrimitiveLongFSTIntersectEnum {
         low = mid;
       } else {
         frame.transitionUpto = mid + 1;
-        return true;
+        return;
       }
     }
-    if (low != mid) {
-      transitionAccessor.getTransition(frame.fsaState, low, t);
+    transitionAccessor.getTransition(frame.fsaState, low, t);
+    frame.transitionUpto = low + 1;
+  }
+
+  private boolean fsaAdvanceCeilSlow(Frame frame, int target) {
+    while (frame.transitionUpto < frame.numTransitions) {
+      transitionAccessor.getNextTransition(frame.fsaTransition);
+      frame.transitionUpto++;
+      if (target <= frame.fsaTransition.max) {
+        return frame.fsaTransition.min <= target;
+      }
     }
-    if (target <= t.max) {
-      frame.transitionUpto = low + 1;
-      return true;
-    } else {
-      return false;
-    }
+    return false;
   }
 
   /**

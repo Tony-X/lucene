@@ -19,6 +19,8 @@ package org.apache.lucene.util.fst;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ByteArrayDataOutput;
 import org.apache.lucene.store.DataOutput;
@@ -36,8 +38,7 @@ public class TestPrimitiveLongFSTIntersectEnum extends LuceneTestCase {
 
   public void testBasics() throws IOException {
     String[] testTerms = {
-      "aaa", "abb", "acc", "accd", "acce", "accf", "ada", "adf", "alf", "azf", "bfg", "caa", "ceb",
-      "de", "ff", "gg", "hh", "zz", "zzx", "zzz"
+      "!", "*", "+", "++", "+++b", "++c", "a", "b", "bb", "dd",
     };
 
     HashMap<String, Long> termOutputs = new HashMap<>();
@@ -70,7 +71,7 @@ public class TestPrimitiveLongFSTIntersectEnum extends LuceneTestCase {
             new ByteArrayDataInput(dataBytes));
 
     //    RegExp regExp = new RegExp("a([a-f]|[j-z])c", RegExp.NONE);
-    RegExp regExp = new RegExp("a([a-b]|[d-e]|[g-h]|[j-l]|[n-o]|[q-r]|[t-x]|z)f", RegExp.NONE);
+    RegExp regExp = new RegExp("+*.", RegExp.NONE);
     Automaton a = regExp.toAutomaton();
     CompiledAutomaton compiledAutomaton = new CompiledAutomaton(a);
 
@@ -92,7 +93,7 @@ public class TestPrimitiveLongFSTIntersectEnum extends LuceneTestCase {
 
     System.out.println("---- non-recursive algo ----");
     var intersectEnum =
-        new PrimitiveLongFSTIntersectEnum(primitiveLongFst, compiledAutomaton, new BytesRef("ahg"));
+        new PrimitiveLongFSTIntersectEnum(primitiveLongFst, compiledAutomaton, null);
     while (intersectEnum.next()) {
       String term = intersectEnum.getTerm().utf8ToString();
       long actualOutput = intersectEnum.getFSTOutput();
@@ -129,30 +130,115 @@ public class TestPrimitiveLongFSTIntersectEnum extends LuceneTestCase {
   }
 
   public void testAutomaton() {
-    RegExp regExp = new RegExp("a([a-f]|[j-z])c", RegExp.NONE);
+    RegExp regExp = new RegExp("+*.", RegExp.NONE);
     Automaton a = regExp.toAutomaton();
     CompiledAutomaton compiledAutomaton = new CompiledAutomaton(a);
     System.out.println("isFinite: " + compiledAutomaton.finite);
 
     var byteRunnable = compiledAutomaton.getByteRunnable();
     var transitionAccessor = compiledAutomaton.getTransitionAccessor();
-    dfsAutomaton(byteRunnable, transitionAccessor, 0, "");
+    // dfsAutomaton(byteRunnable, transitionAccessor, 0, "");
+    //     dumpTransitionsViaNext(byteRunnable, transitionAccessor, 0, new HashSet<>());
+    dumpTransitionsViaRA(byteRunnable, transitionAccessor, 0, new HashSet<>());
   }
 
   void dfsAutomaton(
       ByteRunnable a, TransitionAccessor transitionAccessor, int currentLevelState, String path) {
     if (a.isAccept(currentLevelState)) {
-      System.out.println(path);
+      if (path.length() > 50) {
+        throw new RuntimeException();
+      }
+      System.out.println("found: " + path);
     }
 
-    Transition t = new Transition();
-    int currentLevelSize = transitionAccessor.initTransition(currentLevelState, t);
+    int currentLevelSize = transitionAccessor.getNumTransitions(currentLevelState);
     for (int i = 0; i < currentLevelSize; i++) {
+      Transition t = new Transition();
       transitionAccessor.getNextTransition(t);
-      System.out.println("At: " + t);
-      for (int label = t.min; label <= t.max && Character.isAlphabetic(label); label++) {
-        dfsAutomaton(a, transitionAccessor, t.dest, path + (char) label);
+      System.out.println(
+          "At: src: "
+              + t.source
+              + " ["
+              + t.min
+              + ", "
+              + t.max
+              + "] "
+              + "dest: "
+              + t.dest
+              + " is dest accept: "
+              + (a.isAccept(t.dest) ? "yes" : "no"));
+      for (int label = t.min; label <= t.max; label++) {
+        dfsAutomaton(a, transitionAccessor, t.dest, path + " " + label);
       }
+    }
+  }
+
+  void dumpTransitionsViaNext(
+      ByteRunnable a,
+      TransitionAccessor transitionAccessor,
+      int currentState,
+      Set<Integer> seenStates) {
+    if (seenStates.contains(currentState)) {
+      return;
+    }
+
+    seenStates.add(currentState);
+
+    var t = new Transition();
+    var numStates = transitionAccessor.initTransition(currentState, t);
+
+    for (int i = 0; i < numStates; i++) {
+      transitionAccessor.getNextTransition(t);
+      System.out.println(
+          "At: src: "
+              + t.source
+              + " arcIdx: "
+              + i
+              + "  ["
+              + t.min
+              + ", "
+              + t.max
+              + "] "
+              + "dest: "
+              + t.dest
+              + " is dest accept: "
+              + (a.isAccept(t.dest) ? "yes" : "no"));
+      dumpTransitionsViaNext(a, transitionAccessor, t.dest, seenStates);
+    }
+  }
+
+  void dumpTransitionsViaRA(
+      ByteRunnable a,
+      TransitionAccessor transitionAccessor,
+      int currentState,
+      Set<Integer> seenStates) {
+    if (seenStates.contains(currentState)) {
+      return;
+    }
+
+    seenStates.add(currentState);
+
+    var t = new Transition();
+    var numStates = transitionAccessor.initTransition(currentState, t);
+
+    // transitionAccessor.getTransition(currentState, numStates - 1, t);
+    for (int i = 0; i < numStates; i++) {
+      transitionAccessor.getTransition(currentState, i, t);
+      System.out.println(
+          "At: src: "
+              + t.source
+              + " arcIdx: "
+              + i
+              + "  ["
+              + t.min
+              + ", "
+              + t.max
+              + "] "
+              + "dest: "
+              + t.dest
+              + " is dest accept: "
+              + (a.isAccept(t.dest) ? "yes" : "no"));
+      dumpTransitionsViaRA(a, transitionAccessor, t.dest, seenStates);
     }
   }
 

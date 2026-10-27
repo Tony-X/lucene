@@ -99,6 +99,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
   private final int tinySegmentsThreshold;
   private final PipnnParams pipnnParams;
   private final PipnnParams flushPipnnParams;
+  private final int flushPipnnWorkers;
   private final int version;
 
   private final List<FieldWriter<?>> fields = new ArrayList<>();
@@ -131,6 +132,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         HNSW_GRAPH_THRESHOLD,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -155,6 +157,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         tinySegmentsThreshold,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -169,6 +172,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       int tinySegmentsThreshold,
       PipnnParams pipnnParams,
       PipnnParams flushPipnnParams,
+      int flushPipnnWorkers,
       int version)
       throws IOException {
     this.M = M;
@@ -180,6 +184,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     this.tinySegmentsThreshold = tinySegmentsThreshold;
     this.pipnnParams = pipnnParams;
     this.flushPipnnParams = flushPipnnParams;
+    this.flushPipnnWorkers = flushPipnnWorkers;
     this.version = version;
     segmentWriteState = state;
     String metaFileName =
@@ -227,7 +232,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
             beamWidth,
             segmentWriteState.infoStream,
             tinySegmentsThreshold,
-            flushPipnnParams);
+            flushPipnnParams,
+            flushPipnnWorkers > 1 ? mergeExec : null,
+            flushPipnnWorkers);
     fields.add(newField);
     return newField;
   }
@@ -790,6 +797,11 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     /** Non-null to build the flush graph with PiPNN at flush time instead of HNSW insertion. */
     private final PipnnParams flushPipnnParams;
 
+    /** Executor and worker count for the flush-time PiPNN build; null executor means 1 thread. */
+    private final TaskExecutor flushExec;
+
+    private final int flushWorkers;
+
     /** Nanoseconds spent in {@link HnswGraphBuilder#addGraphNode} during indexing. */
     private long graphInsertNs;
 
@@ -802,7 +814,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         int beamWidth,
         InfoStream infoStream,
         int tinySegmentsThreshold,
-        PipnnParams flushPipnnParams)
+        PipnnParams flushPipnnParams,
+        TaskExecutor flushExec,
+        int flushWorkers)
         throws IOException {
       return switch (fieldInfo.getVectorEncoding()) {
         case BYTE ->
@@ -814,7 +828,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 beamWidth,
                 infoStream,
                 tinySegmentsThreshold,
-                null);
+                null,
+                null,
+                1);
         case FLOAT16 ->
             new FieldWriter<>(
                 scorer,
@@ -824,7 +840,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 beamWidth,
                 infoStream,
                 tinySegmentsThreshold,
-                null);
+                null,
+                null,
+                1);
         case FLOAT32 ->
             new FieldWriter<>(
                 scorer,
@@ -834,7 +852,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 beamWidth,
                 infoStream,
                 tinySegmentsThreshold,
-                flushPipnnParams);
+                flushPipnnParams,
+                flushExec,
+                flushWorkers);
       };
     }
 
@@ -847,7 +867,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         int beamWidth,
         InfoStream infoStream,
         int tinySegmentsThreshold,
-        PipnnParams flushPipnnParams)
+        PipnnParams flushPipnnParams,
+        TaskExecutor flushExec,
+        int flushWorkers)
         throws IOException {
       this.fieldInfo = fieldInfo;
       this.M = M;
@@ -856,6 +878,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       this.flatFieldVectorsWriter = Objects.requireNonNull(flatFieldVectorsWriter);
       this.graphThreshold = tinySegmentsThreshold;
       this.flushPipnnParams = flushPipnnParams;
+      this.flushExec = flushExec;
+      this.flushWorkers = flushExec == null ? 1 : flushWorkers;
       this.scorerSupplier =
           scorer.getRandomVectorScorerSupplier(
               fieldInfo.getVectorSimilarityFunction(),
@@ -965,8 +989,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                   HnswGraphBuilder.randSeed,
                   node,
                   flushPipnnParams,
-                  null,
-                  1);
+                  flushExec,
+                  flushWorkers);
           builder.setInfoStream(infoStream);
           return builder.build(node);
         }
@@ -992,7 +1016,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 "FLUSHGRAPH field=%s vectors=%d builder=%s insert=%.1f ms build=%.1f ms write=%.1f ms",
                 fieldInfo.name,
                 node,
-                flushPipnnParams != null ? "pipnn" : "hnsw",
+                flushPipnnParams != null ? "pipnn/w" + flushWorkers : "hnsw",
                 graphInsertNs / 1_000_000.0,
                 buildNs / 1_000_000.0,
                 writeNs / 1_000_000.0));

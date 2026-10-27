@@ -180,6 +180,9 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
 
   private final PipnnParams flushPipnnParams;
 
+  /** Workers for the flush-time PiPNN build; above 1 the merge executor is used. */
+  private final int flushPipnnWorkers;
+
   private final int writeVersion;
 
   /** Constructs a format using default graph construction parameters */
@@ -192,6 +195,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         HNSW_GRAPH_THRESHOLD,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -210,6 +214,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         HNSW_GRAPH_THRESHOLD,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -230,6 +235,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         tinySegmentsThreshold,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -254,6 +260,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         HNSW_GRAPH_THRESHOLD,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -285,6 +292,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         tinySegmentsThreshold,
         null,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -316,6 +324,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         HNSW_GRAPH_THRESHOLD,
         pipnnParams,
         null,
+        1,
         VERSION_CURRENT);
   }
 
@@ -333,6 +342,22 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
       ExecutorService mergeExec,
       PipnnParams pipnnParams,
       PipnnParams flushPipnnParams) {
+    this(maxConn, beamWidth, numMergeWorkers, mergeExec, pipnnParams, flushPipnnParams, 1);
+  }
+
+  /**
+   * Like {@link #Lucene99HnswVectorsFormat(int, int, int, ExecutorService, PipnnParams,
+   * PipnnParams)} but runs the flush-time PiPNN build with {@code flushPipnnWorkers} workers on the
+   * merge executor (which must be non-null when more than one worker is requested). Experimental.
+   */
+  public Lucene99HnswVectorsFormat(
+      int maxConn,
+      int beamWidth,
+      int numMergeWorkers,
+      ExecutorService mergeExec,
+      PipnnParams pipnnParams,
+      PipnnParams flushPipnnParams,
+      int flushPipnnWorkers) {
     this(
         maxConn,
         beamWidth,
@@ -341,6 +366,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         HNSW_GRAPH_THRESHOLD,
         pipnnParams,
         flushPipnnParams,
+        flushPipnnWorkers,
         VERSION_CURRENT);
   }
 
@@ -368,6 +394,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
       int tinySegmentsThreshold,
       PipnnParams pipnnParams,
       PipnnParams flushPipnnParams,
+      int flushPipnnWorkers,
       int writeVersion) {
     super("Lucene99HnswVectorsFormat");
     if (maxConn <= 0 || maxConn > MAXIMUM_MAX_CONN) {
@@ -389,6 +416,11 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
     this.tinySegmentsThreshold = tinySegmentsThreshold;
     this.pipnnParams = pipnnParams;
     this.flushPipnnParams = flushPipnnParams;
+    if (flushPipnnWorkers < 1 || (flushPipnnWorkers > 1 && mergeExec == null)) {
+      throw new IllegalArgumentException(
+          "flushPipnnWorkers must be >= 1 and needs mergeExec above 1; got " + flushPipnnWorkers);
+    }
+    this.flushPipnnWorkers = flushPipnnWorkers;
     this.writeVersion = writeVersion;
     if (numMergeWorkers == 1 && mergeExec != null) {
       throw new IllegalArgumentException(
@@ -415,6 +447,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         tinySegmentsThreshold,
         pipnnParams,
         flushPipnnParams,
+        flushPipnnWorkers,
         writeVersion);
   }
 
@@ -440,7 +473,9 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         + ", tinySegmentsThreshold="
         + tinySegmentsThreshold
         + (pipnnParams == null ? "" : ", pipnnParams=" + pipnnParams)
-        + (flushPipnnParams == null ? "" : ", flushPipnnParams=" + flushPipnnParams)
+        + (flushPipnnParams == null
+            ? ""
+            : ", flushPipnnParams=" + flushPipnnParams + ", flushPipnnWorkers=" + flushPipnnWorkers)
         + ", flatVectorFormat="
         + flatVectorsFormat
         + ")";

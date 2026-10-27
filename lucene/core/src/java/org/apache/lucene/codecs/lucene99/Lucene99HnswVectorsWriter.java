@@ -23,6 +23,7 @@ import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat.HNSW_G
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat.VERSION_CURRENT;
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat.VERSION_GROUPVARINT;
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.SIMILARITY_FUNCTIONS;
+import static org.apache.lucene.util.hnsw.HnswGraphBuilder.HNSW_COMPONENT;
 import static org.apache.lucene.util.hnsw.HnswGraphSearcher.expectedVisitedNodes;
 
 import java.io.Closeable;
@@ -30,6 +31,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnFieldVectorsWriter;
@@ -68,6 +70,7 @@ import org.apache.lucene.util.hnsw.HnswGraphMerger;
 import org.apache.lucene.util.hnsw.IncrementalHnswGraphMerger;
 import org.apache.lucene.util.hnsw.NeighborArray;
 import org.apache.lucene.util.hnsw.OnHeapHnswGraph;
+import org.apache.lucene.util.hnsw.PipnnGraphBuilder;
 import org.apache.lucene.util.hnsw.PipnnHnswGraphMerger;
 import org.apache.lucene.util.hnsw.PipnnParams;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
@@ -95,6 +98,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
   private final TaskExecutor mergeExec;
   private final int tinySegmentsThreshold;
   private final PipnnParams pipnnParams;
+  private final PipnnParams flushPipnnParams;
   private final int version;
 
   private final List<FieldWriter<?>> fields = new ArrayList<>();
@@ -126,6 +130,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         mergeExec,
         HNSW_GRAPH_THRESHOLD,
         null,
+        null,
         VERSION_CURRENT);
   }
 
@@ -149,6 +154,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         mergeExec,
         tinySegmentsThreshold,
         null,
+        null,
         VERSION_CURRENT);
   }
 
@@ -162,6 +168,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       TaskExecutor mergeExec,
       int tinySegmentsThreshold,
       PipnnParams pipnnParams,
+      PipnnParams flushPipnnParams,
       int version)
       throws IOException {
     this.M = M;
@@ -172,6 +179,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     this.mergeExec = mergeExec;
     this.tinySegmentsThreshold = tinySegmentsThreshold;
     this.pipnnParams = pipnnParams;
+    this.flushPipnnParams = flushPipnnParams;
     this.version = version;
     segmentWriteState = state;
     String metaFileName =
@@ -218,20 +226,34 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
             M,
             beamWidth,
             segmentWriteState.infoStream,
-            tinySegmentsThreshold);
+            tinySegmentsThreshold,
+            flushPipnnParams);
     fields.add(newField);
     return newField;
   }
 
   @Override
   public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
+    long startNs = System.nanoTime();
     flatVectorWriter.flush(maxDoc, sortMap);
+    long flatNs = System.nanoTime() - startNs;
     for (FieldWriter<?> field : fields) {
       if (sortMap == null) {
         writeField(field);
       } else {
         writeSortingField(field, sortMap);
       }
+    }
+    InfoStream infoStream = segmentWriteState.infoStream;
+    if (infoStream.isEnabled(HNSW_COMPONENT)) {
+      infoStream.message(
+          HNSW_COMPONENT,
+          String.format(
+              Locale.ROOT,
+              "FLUSH segment=%s total=%.1f ms flat=%.1f ms",
+              segmentWriteState.segmentInfo.name,
+              (System.nanoTime() - startNs) / 1_000_000.0,
+              flatNs / 1_000_000.0));
     }
   }
 
@@ -268,8 +290,12 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
   private void writeField(FieldWriter<?> fieldData) throws IOException {
     // write graph
     long vectorIndexOffset = vectorIndex.getFilePointer();
+    long t0 = System.nanoTime();
     OnHeapHnswGraph graph = fieldData.getGraph();
+    long t1 = System.nanoTime();
     int[][] graphLevelNodeOffsets = writeGraph(graph);
+    long t2 = System.nanoTime();
+    fieldData.logFlushStages(t1 - t0, t2 - t1);
     long vectorIndexLength = vectorIndex.getFilePointer() - vectorIndexOffset;
 
     writeMeta(
@@ -291,9 +317,13 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     mapOldOrdToNewOrd(fieldData.getDocsWithFieldSet(), sortMap, oldOrdMap, ordMap, null);
     // write graph
     long vectorIndexOffset = vectorIndex.getFilePointer();
+    long t0 = System.nanoTime();
     OnHeapHnswGraph graph = fieldData.getGraph();
+    long t1 = System.nanoTime();
     int[][] graphLevelNodeOffsets = graph == null ? new int[0][] : new int[graph.numLevels()][];
     HnswGraph mockGraph = reconstructAndWriteGraph(graph, ordMap, oldOrdMap, graphLevelNodeOffsets);
+    long t2 = System.nanoTime();
+    fieldData.logFlushStages(t1 - t0, t2 - t1);
     long vectorIndexLength = vectorIndex.getFilePointer() - vectorIndexOffset;
 
     writeMeta(
@@ -757,6 +787,12 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     private final InfoStream infoStream;
     private final RandomVectorScorerSupplier scorerSupplier;
 
+    /** Non-null to build the flush graph with PiPNN at flush time instead of HNSW insertion. */
+    private final PipnnParams flushPipnnParams;
+
+    /** Nanoseconds spent in {@link HnswGraphBuilder#addGraphNode} during indexing. */
+    private long graphInsertNs;
+
     @SuppressWarnings("unchecked")
     static FieldWriter<?> create(
         FlatVectorsScorer scorer,
@@ -765,7 +801,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         int M,
         int beamWidth,
         InfoStream infoStream,
-        int tinySegmentsThreshold)
+        int tinySegmentsThreshold,
+        PipnnParams flushPipnnParams)
         throws IOException {
       return switch (fieldInfo.getVectorEncoding()) {
         case BYTE ->
@@ -776,7 +813,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 M,
                 beamWidth,
                 infoStream,
-                tinySegmentsThreshold);
+                tinySegmentsThreshold,
+                null);
         case FLOAT16 ->
             new FieldWriter<>(
                 scorer,
@@ -785,7 +823,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 M,
                 beamWidth,
                 infoStream,
-                tinySegmentsThreshold);
+                tinySegmentsThreshold,
+                null);
         case FLOAT32 ->
             new FieldWriter<>(
                 scorer,
@@ -794,7 +833,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 M,
                 beamWidth,
                 infoStream,
-                tinySegmentsThreshold);
+                tinySegmentsThreshold,
+                flushPipnnParams);
       };
     }
 
@@ -806,7 +846,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
         int M,
         int beamWidth,
         InfoStream infoStream,
-        int tinySegmentsThreshold)
+        int tinySegmentsThreshold,
+        PipnnParams flushPipnnParams)
         throws IOException {
       this.fieldInfo = fieldInfo;
       this.M = M;
@@ -814,6 +855,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       this.infoStream = infoStream;
       this.flatFieldVectorsWriter = Objects.requireNonNull(flatFieldVectorsWriter);
       this.graphThreshold = tinySegmentsThreshold;
+      this.flushPipnnParams = flushPipnnParams;
       this.scorerSupplier =
           scorer.getRandomVectorScorerSupplier(
               fieldInfo.getVectorSimilarityFunction(),
@@ -827,7 +869,8 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     }
 
     private void initializeGraphBuilder() throws IOException {
-      if (hnswGraphBuilder != null) {
+      if (hnswGraphBuilder != null || flushPipnnParams != null) {
+        // with a flush-time PiPNN build the graph is only created in getGraph()
         return;
       }
       this.hnswGraphBuilder =
@@ -836,9 +879,11 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     }
 
     private void replayBufferedVectors() throws IOException {
+      long start = System.nanoTime();
       for (int i = 0; i < flatFieldVectorsWriter.getVectors().size(); i++) {
         hnswGraphBuilder.addGraphNode(i);
       }
+      graphInsertNs += System.nanoTime() - start;
     }
 
     @Override
@@ -850,13 +895,17 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
                 + "\" appears more than once in this document (only one value is allowed per field)");
       }
       flatFieldVectorsWriter.addValue(docID, vectorValue);
-      // Check if we need to initialize graph builder for tiny segment optimization
-      if (hnswGraphBuilder == null && shouldCreateGraph(graphThreshold, node + 1)) {
+      if (flushPipnnParams != null) {
+        // graph is built at flush time
+      } else if (hnswGraphBuilder == null && shouldCreateGraph(graphThreshold, node + 1)) {
+        // Check if we need to initialize graph builder for tiny segment optimization
         initializeGraphBuilder();
         replayBufferedVectors();
       } else if (hnswGraphBuilder != null) {
         // Graph builder is active, add to graph
+        long start = System.nanoTime();
         hnswGraphBuilder.addGraphNode(node);
+        graphInsertNs += System.nanoTime() - start;
       }
       node++;
       lastDocID = docID;
@@ -878,10 +927,14 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       final int firstNode = node;
       node += count;
       lastDocID = firstDocID + count - 1;
-      if (hnswGraphBuilder != null) {
+      if (flushPipnnParams != null) {
+        // graph is built at flush time
+      } else if (hnswGraphBuilder != null) {
+        long start = System.nanoTime();
         for (int ord = firstNode; ord < node; ord++) {
           hnswGraphBuilder.addGraphNode(ord);
         }
+        graphInsertNs += System.nanoTime() - start;
       } else if (shouldCreateGraph(graphThreshold, node)) {
         initializeGraphBuilder();
         replayBufferedVectors();
@@ -899,11 +952,50 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
 
     OnHeapHnswGraph getGraph() throws IOException {
       assert flatFieldVectorsWriter.isFinished();
+      if (flushPipnnParams != null) {
+        if (node > 0 && shouldCreateGraph(graphThreshold, node)) {
+          PipnnGraphBuilder builder =
+              PipnnGraphBuilder.create(
+                  scorerSupplier,
+                  flatFieldVectorsWriter.asKnnVectorValues(
+                      fieldInfo.getVectorEncoding(), fieldInfo.getVectorDimension()),
+                  fieldInfo.getVectorSimilarityFunction(),
+                  M,
+                  beamWidth,
+                  HnswGraphBuilder.randSeed,
+                  node,
+                  flushPipnnParams,
+                  null,
+                  1);
+          builder.setInfoStream(infoStream);
+          return builder.build(node);
+        }
+        return null;
+      }
       if (hnswGraphBuilder != null && node > 0) {
         return hnswGraphBuilder.getCompletedGraph();
       } else {
         // No graph
         return null;
+      }
+    }
+
+    /**
+     * Reports where the flush graph time went: insertion during indexing, build and write at flush.
+     */
+    void logFlushStages(long buildNs, long writeNs) {
+      if (infoStream.isEnabled(HNSW_COMPONENT)) {
+        infoStream.message(
+            HNSW_COMPONENT,
+            String.format(
+                Locale.ROOT,
+                "FLUSHGRAPH field=%s vectors=%d builder=%s insert=%.1f ms build=%.1f ms write=%.1f ms",
+                fieldInfo.name,
+                node,
+                flushPipnnParams != null ? "pipnn" : "hnsw",
+                graphInsertNs / 1_000_000.0,
+                buildNs / 1_000_000.0,
+                writeNs / 1_000_000.0));
       }
     }
 

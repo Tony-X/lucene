@@ -178,6 +178,8 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
    */
   private final PipnnParams pipnnParams;
 
+  private final PipnnParams flushPipnnParams;
+
   private final int writeVersion;
 
   /** Constructs a format using default graph construction parameters */
@@ -188,6 +190,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         DEFAULT_NUM_MERGE_WORKER,
         null,
         HNSW_GRAPH_THRESHOLD,
+        null,
         null,
         VERSION_CURRENT);
   }
@@ -205,6 +208,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         DEFAULT_NUM_MERGE_WORKER,
         null,
         HNSW_GRAPH_THRESHOLD,
+        null,
         null,
         VERSION_CURRENT);
   }
@@ -224,6 +228,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         DEFAULT_NUM_MERGE_WORKER,
         null,
         tinySegmentsThreshold,
+        null,
         null,
         VERSION_CURRENT);
   }
@@ -247,6 +252,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         numMergeWorkers,
         mergeExec,
         HNSW_GRAPH_THRESHOLD,
+        null,
         null,
         VERSION_CURRENT);
   }
@@ -278,6 +284,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         mergeExec,
         tinySegmentsThreshold,
         null,
+        null,
         VERSION_CURRENT);
   }
 
@@ -308,6 +315,32 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         mergeExec,
         HNSW_GRAPH_THRESHOLD,
         pipnnParams,
+        null,
+        VERSION_CURRENT);
+  }
+
+  /**
+   * Like {@link #Lucene99HnswVectorsFormat(int, int, int, ExecutorService, PipnnParams)} but also
+   * builds the graph of flushed segments with PiPNN (single-threaded, at flush time) instead of
+   * inserting into an HNSW graph during indexing. Experimental.
+   *
+   * @param flushPipnnParams parameters of the flush-time build, or null to keep HNSW insertion
+   */
+  public Lucene99HnswVectorsFormat(
+      int maxConn,
+      int beamWidth,
+      int numMergeWorkers,
+      ExecutorService mergeExec,
+      PipnnParams pipnnParams,
+      PipnnParams flushPipnnParams) {
+    this(
+        maxConn,
+        beamWidth,
+        numMergeWorkers,
+        mergeExec,
+        HNSW_GRAPH_THRESHOLD,
+        pipnnParams,
+        flushPipnnParams,
         VERSION_CURRENT);
   }
 
@@ -334,6 +367,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
       ExecutorService mergeExec,
       int tinySegmentsThreshold,
       PipnnParams pipnnParams,
+      PipnnParams flushPipnnParams,
       int writeVersion) {
     super("Lucene99HnswVectorsFormat");
     if (maxConn <= 0 || maxConn > MAXIMUM_MAX_CONN) {
@@ -354,6 +388,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
     this.beamWidth = beamWidth;
     this.tinySegmentsThreshold = tinySegmentsThreshold;
     this.pipnnParams = pipnnParams;
+    this.flushPipnnParams = flushPipnnParams;
     this.writeVersion = writeVersion;
     if (numMergeWorkers == 1 && mergeExec != null) {
       throw new IllegalArgumentException(
@@ -379,6 +414,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         mergeExec,
         tinySegmentsThreshold,
         pipnnParams,
+        flushPipnnParams,
         writeVersion);
   }
 
@@ -404,6 +440,7 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
         + ", tinySegmentsThreshold="
         + tinySegmentsThreshold
         + (pipnnParams == null ? "" : ", pipnnParams=" + pipnnParams)
+        + (flushPipnnParams == null ? "" : ", flushPipnnParams=" + flushPipnnParams)
         + ", flatVectorFormat="
         + flatVectorsFormat
         + ")";

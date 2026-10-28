@@ -180,7 +180,10 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
 
   private final PipnnParams flushPipnnParams;
 
-  /** Workers for the flush-time PiPNN build; above 1 the merge executor is used. */
+  /**
+   * Workers for the flush-time PiPNN build; above 1 the merge executor is used. Zero writes flushed
+   * segments without any graph (experiment lower bound: all graph work deferred to the merge).
+   */
   private final int flushPipnnWorkers;
 
   private final int writeVersion;
@@ -416,9 +419,9 @@ public final class Lucene99HnswVectorsFormat extends KnnVectorsFormat {
     this.tinySegmentsThreshold = tinySegmentsThreshold;
     this.pipnnParams = pipnnParams;
     this.flushPipnnParams = flushPipnnParams;
-    if (flushPipnnWorkers < 1 || (flushPipnnWorkers > 1 && mergeExec == null)) {
+    if (flushPipnnWorkers < 0 || (flushPipnnWorkers > 1 && mergeExec == null)) {
       throw new IllegalArgumentException(
-          "flushPipnnWorkers must be >= 1 and needs mergeExec above 1; got " + flushPipnnWorkers);
+          "flushPipnnWorkers must be >= 0 and needs mergeExec above 1; got " + flushPipnnWorkers);
     }
     this.flushPipnnWorkers = flushPipnnWorkers;
     this.writeVersion = writeVersion;

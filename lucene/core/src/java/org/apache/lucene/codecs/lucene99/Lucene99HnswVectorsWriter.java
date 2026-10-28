@@ -879,7 +879,7 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
       this.graphThreshold = tinySegmentsThreshold;
       this.flushPipnnParams = flushPipnnParams;
       this.flushExec = flushExec;
-      this.flushWorkers = flushExec == null ? 1 : flushWorkers;
+      this.flushWorkers = flushWorkers == 0 ? 0 : (flushExec == null ? 1 : flushWorkers);
       this.scorerSupplier =
           scorer.getRandomVectorScorerSupplier(
               fieldInfo.getVectorSimilarityFunction(),
@@ -977,6 +977,9 @@ public final class Lucene99HnswVectorsWriter extends KnnVectorsWriter {
     OnHeapHnswGraph getGraph() throws IOException {
       assert flatFieldVectorsWriter.isFinished();
       if (flushPipnnParams != null) {
+        if (flushWorkers == 0) {
+          return null; // experiment: no flush graph at all
+        }
         if (node > 0 && shouldCreateGraph(graphThreshold, node)) {
           PipnnGraphBuilder builder =
               PipnnGraphBuilder.create(

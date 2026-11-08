@@ -79,6 +79,15 @@ public final class PipnnNativeKernel {
     }
   }
 
+  /** Dot product of {@code dim} fp16 values held in two memory segments (heap or off-heap). */
+  public static float dot16(MemorySegment a, MemorySegment b, int dim) {
+    try {
+      return (float) DOT16.invokeExact(a, b, dim);
+    } catch (Throwable t) {
+      throw new RuntimeException(t);
+    }
+  }
+
   /** Same contract as {@link org.apache.lucene.util.VectorUtil#dotProducts}, over fp16 rows. */
   public static void dotProducts16(
       short[] a,

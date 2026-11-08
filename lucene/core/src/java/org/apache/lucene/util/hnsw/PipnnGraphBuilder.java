@@ -25,9 +25,9 @@ import java.util.SplittableRandom;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
+import org.apache.lucene.index.Float16VectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
-import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.IntHashSet;
 import org.apache.lucene.search.TaskExecutor;
@@ -580,42 +580,60 @@ public final class PipnnGraphBuilder extends HnswGraphBuilder {
   }
 
   /**
-   * Vectors gathered into one contiguous padded float array so that many pairs can be scored at
-   * once with {@link VectorUtil#dotProducts}, together with the per vector terms that turn a raw
-   * dot product into the configured similarity's score. Only float vectors are supported; other
-   * encodings go through the scorer instead.
+   * Vectors gathered into one contiguous padded array so that many pairs can be scored at once with
+   * {@link VectorUtil#dotProducts}, together with the per vector terms that turn a raw dot product
+   * into the configured similarity's score. Float vectors are gathered as they are. Float16 vectors
+   * are either decoded to float32 while gathering (fp16 storage, fp32 arithmetic), or, when the
+   * experimental {@link PipnnNativeKernel} is loaded, gathered as fp16 rows and scored with its
+   * fp16 kernel. Other encodings go through the scorer instead.
    */
   private final class GatheredVectors {
     private final FloatVectorValues floatVectors;
+    private final Float16VectorValues halfVectors;
     final int dim;
-    // distance between consecutive vectors, padded off a multiple of 1024 floats (4 KB) so the
-    // rows of a tile do not map to the same cache sets
+    // distance between consecutive vectors, padded off a multiple of 1024 elements so the rows of a
+    // tile do not map to the same cache sets
     final int stride;
+    // exactly one of these is non-null
     float[] vectors;
+    short[] halfRows;
     private float[] norms;
 
     /** Returns null when the encoding cannot be gathered. */
     static GatheredVectors create(PipnnGraphBuilder builder, int capacity) throws IOException {
       KnnVectorValues v = builder.vectors;
-      if (v.getEncoding() == VectorEncoding.FLOAT32) {
-        return builder.new GatheredVectors(((FloatVectorValues) v).copy(), capacity);
-      }
-      return null;
+      return switch (v.getEncoding()) {
+        case FLOAT32 -> builder.new GatheredVectors(((FloatVectorValues) v).copy(), null, capacity);
+        case FLOAT16 ->
+            builder.new GatheredVectors(null, ((Float16VectorValues) v).copy(), capacity);
+        default -> null;
+      };
     }
 
-    private GatheredVectors(FloatVectorValues floatVectors, int capacity) throws IOException {
+    private GatheredVectors(
+        FloatVectorValues floatVectors, Float16VectorValues halfVectors, int capacity)
+        throws IOException {
       this.floatVectors = floatVectors;
+      this.halfVectors = halfVectors;
       this.dim = PipnnGraphBuilder.this.vectors.dimension();
       this.stride = dim % 1024 == 0 ? dim + 16 : dim;
       ensureCapacity(capacity);
     }
 
+    private boolean nativeHalf() {
+      return halfVectors != null && PipnnNativeKernel.AVAILABLE;
+    }
+
     void ensureCapacity(int size) {
-      if (vectors != null && size * stride <= vectors.length) {
-        return;
+      if (nativeHalf()) {
+        if (halfRows == null || size * stride > halfRows.length) {
+          halfRows = new short[size * stride];
+          norms = new float[size];
+        }
+      } else if (vectors == null || size * stride > vectors.length) {
+        vectors = new float[size * stride];
+        norms = new float[size];
       }
-      vectors = new float[size * stride];
-      norms = new float[size];
     }
 
     /** Gathers the vectors of {@code ords[from, to)} into rows {@code 0, to - from}. */
@@ -626,11 +644,62 @@ public final class PipnnGraphBuilder extends HnswGraphBuilder {
           similarityFunction == VectorSimilarityFunction.EUCLIDEAN
               || similarityFunction == VectorSimilarityFunction.COSINE;
       for (int i = 0; i < size; i++) {
-        float[] vector = floatVectors.vectorValue(ords[from + i]);
-        System.arraycopy(vector, 0, vectors, i * stride, dim);
-        if (needNorms) {
-          norms[i] = VectorUtil.dotProduct(vector, vector);
+        int row = i * stride;
+        if (floatVectors != null) {
+          float[] vector = floatVectors.vectorValue(ords[from + i]);
+          System.arraycopy(vector, 0, vectors, row, dim);
+          if (needNorms) {
+            norms[i] = VectorUtil.dotProduct(vector, vector);
+          }
+        } else if (nativeHalf()) {
+          short[] vector = halfVectors.vectorValue(ords[from + i]);
+          System.arraycopy(vector, 0, halfRows, row, dim);
+          if (needNorms) {
+            norms[i] = PipnnNativeKernel.dot16(vector, 0, vector, 0, dim);
+          }
+        } else {
+          short[] vector = halfVectors.vectorValue(ords[from + i]);
+          float norm = 0;
+          for (int d = 0; d < dim; d++) {
+            float f = Float.float16ToFloat(vector[d]);
+            vectors[row + d] = f;
+            norm = Math.fma(f, f, norm);
+          }
+          if (needNorms) {
+            norms[i] = norm;
+          }
         }
+      }
+    }
+
+    /**
+     * Raw dot products of this set's rows {@code [aFrom, aFrom + aCount)} against {@code other}'s
+     * rows {@code [bFrom, bFrom + bCount)}, into {@code out[i * bCount + j]}.
+     */
+    void dotProducts(
+        int aFrom, int aCount, GatheredVectors other, int bFrom, int bCount, float[] out) {
+      if (nativeHalf()) {
+        PipnnNativeKernel.dotProducts16(
+            halfRows,
+            aFrom * stride,
+            aCount,
+            other.halfRows,
+            bFrom * stride,
+            bCount,
+            dim,
+            stride,
+            out);
+      } else {
+        VectorUtil.dotProducts(
+            vectors,
+            aFrom * stride,
+            aCount,
+            other.vectors,
+            bFrom * stride,
+            bCount,
+            dim,
+            stride,
+            out);
       }
     }
 
@@ -685,16 +754,7 @@ public final class PipnnGraphBuilder extends HnswGraphBuilder {
       for (int b0 = from; b0 < to; b0 += ASSIGN_BLOCK) {
         int rows = Math.min(ASSIGN_BLOCK, to - b0);
         points.gather(ords, b0, b0 + rows);
-        VectorUtil.dotProducts(
-            points.vectors,
-            0,
-            rows,
-            leaders.vectors,
-            0,
-            numLeaders,
-            points.dim,
-            points.stride,
-            block);
+        points.dotProducts(0, rows, leaders, 0, numLeaders, block);
         for (int r = 0; r < rows; r++) {
           int rowOffset = r * numLeaders;
           for (int l = 0; l < numLeaders; l++) {
@@ -804,13 +864,10 @@ public final class PipnnGraphBuilder extends HnswGraphBuilder {
       if (LEAF_ROW_BLOCK * size > block.length) {
         block = new float[LEAF_ROW_BLOCK * size];
       }
-      float[] vecs = leaf.vectors;
-      int stride = leaf.stride;
       for (int r0 = 0; r0 < size - 1; r0 += LEAF_ROW_BLOCK) {
         int rows = Math.min(LEAF_ROW_BLOCK, size - r0);
         int cols = size - r0;
-        VectorUtil.dotProducts(
-            vecs, r0 * stride, rows, vecs, r0 * stride, cols, leaf.dim, stride, block);
+        leaf.dotProducts(r0, rows, leaf, r0, cols, block);
         for (int r = 0; r < rows; r++) {
           int i = r0 + r;
           int rowOffset = r * cols - r0;
